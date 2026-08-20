@@ -1,0 +1,13 @@
+{
+  "name": "I2C Transaction Analyzer",
+  "apiVersion": "1.0.0",
+  "description": "Parses and groups raw I2C bytes into 1 transaction, handling each ACK/NACK, repeated START condition and idle time.",
+  "author": "Akira Kudo",
+  "version": "1.0.0",
+  "extensions": {
+      "I2C Transaction Analyzer": {
+        "type": "HighLevelAnalyzer",
+        "entryPoint": "HighLevelAnalyzer.I2CTransactionHLA"
+      }
+  }
+}
