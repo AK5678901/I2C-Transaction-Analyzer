@@ -5,7 +5,7 @@ class I2CTransactionHLA(HighLevelAnalyzer):
 
     result_types = {
         'I2C_TA': {
-            'format': 'Addr: {{data.addr}} [{{data.rw_mode}}] Payload: {{data.payload}}'
+            'format': 'Addr: {{data.05_addr}} [{{data.06_rw_mode}}] Payload: {{data.08_payload}}'
         }
     }
 
