@@ -11,6 +11,7 @@ class I2CTransactionHLA(HighLevelAnalyzer):
 
     def __init__(self):
         self.current_tx = None
+        self.pending_tx = None
         self.last_stop_time = None
 
     def decode(self, frame: AnalyzerFrame):
@@ -18,14 +19,26 @@ class I2CTransactionHLA(HighLevelAnalyzer):
         
         if frame_type == 'start':
             if self.current_tx is not None:
-                self.current_tx['is_repeated'] = True
+                # ここに入ったらrepeated STARTで次のトランザクションが開始した
+                # 直前のトランザクションのstop_timeは、開始したトランザクションのstart_timeとし、送り出す
+                self.current_tx['stop_time'] = frame.start_time
+                completed_tx = self.current_tx
+                self.current_tx = None
+                res = self._flush_or_pend(completed_tx)
+                # 新しいトランザクションを開始
+                self.current_tx = {
+                    'start_time': frame.start_time,
+                    'stop_time': None,
+                    'addr': "", 'addr_ack': "", 'is_read_op': False, 'payload': [],
+                    'is_repeated_start': True
+                }
+                return res
             else:
                 self.current_tx = {
                     'start_time': frame.start_time,
                     'stop_time': None,
-                    'addr': "", 'addr_ack': "", 'is_read_op': False, 'w_payload': [],
-                    'rep_addr': "", 'rep_addr_ack': "", 'is_rep_read_op': False, 'r_payload': [],
-                    'is_repeated': False
+                    'addr': "", 'addr_ack': "", 'is_read_op': False, 'payload': [],
+                    'is_repeated_start': False
                 }
         
         elif frame_type == 'address':
@@ -39,15 +52,10 @@ class I2CTransactionHLA(HighLevelAnalyzer):
                 else:
                     addr_val = hex(raw_addr)
                 
-                if not self.current_tx['is_repeated']:
-                    self.current_tx['addr'] = addr_val
-                    self.current_tx['addr_ack'] = ack_str
-                    self.current_tx['is_read_op'] = is_read
-                else:
-                    self.current_tx['rep_addr'] = addr_val
-                    self.current_tx['rep_addr_ack'] = ack_str
-                    self.current_tx['is_rep_read_op'] = is_read
-                    
+                self.current_tx['addr'] = addr_val
+                self.current_tx['addr_ack'] = ack_str
+                self.current_tx['is_read_op'] = is_read
+                
         elif frame_type == 'data':
             if self.current_tx is not None:
                 ack_str = "(A)" if frame.data.get('ack', False) else "(N)"
@@ -61,40 +69,57 @@ class I2CTransactionHLA(HighLevelAnalyzer):
                     data_hex = str(data_val)
                 
                 payload_str = f"{data_hex}{ack_str}"
-                if not self.current_tx['is_repeated']:
-                    self.current_tx['w_payload'].append(payload_str)
-                else:
-                    self.current_tx['r_payload'].append(payload_str)
-                    
+                self.current_tx['payload'].append(payload_str)
+                
         elif frame_type == 'stop':
             if self.current_tx is not None:
                 self.current_tx['stop_time'] = frame.start_time
-                tx = self.current_tx
+                completed_tx = self.current_tx
                 self.current_tx = None
-                
-                return self._process_and_create_frame(tx)
+                return self._flush_or_pend(completed_tx)
                 
         return None
 
-    def _process_and_create_frame(self, tx):
-        addr_val = str(tx['addr']).strip()
-        rep_addr_val = str(tx.get('rep_addr', '')).strip()
+    def _flush_or_pend(self, new_tx):
+        # 除外アドレスのチェック
+        if new_tx is not None:
+            addr_val = str(new_tx['addr']).strip()
+            exclude_str = self.exclude_addr.strip() if self.exclude_addr else ""
+            if exclude_str:
+                exclude_list = [addr.strip().lower() for addr in exclude_str.split(",")]
+                if addr_val.lower() in exclude_list:
+                    self.last_stop_time = new_tx['stop_time']
+                    return None
 
-        # 判定部分
-        exclude_str = self.exclude_addr.strip() if self.exclude_addr else ""
-        if exclude_str:
-            # カンマ区切りで分割し、前後の空白を削除してリスト化
-            exclude_list = [addr.strip().lower() for addr in exclude_str.split(",")]
+        output_frame = None
+        
+        if self.pending_tx is not None:
+            prev = self.pending_tx
+            curr = new_tx
             
-            if addr_val.lower() in exclude_list or rep_addr_val.lower() in exclude_list:
-                self.last_stop_time = tx['stop_time']
-                return None
+            is_w_then_r = False
+            if curr is not None:
+                # 「直前がWrite」かつ「今回がRead」かつ「I2Cアドレスが同じ」かを判定
+                if not prev['is_read_op'] and curr['is_read_op'] and prev['addr'].lower() == curr['addr'].lower():
+                    is_w_then_r = True
 
+            output_frame = self._create_frame(prev, wtr_tx=curr if is_w_then_r else None)
+            
+            if is_w_then_r:
+                self.pending_tx = None
+            else:
+                self.pending_tx = curr
+        else:
+            self.pending_tx = new_tx
+            
+        return output_frame
+
+    def _create_frame(self, tx, wtr_tx=None):
         try:
             start_time = tx['start_time']
-            stop_time = tx['stop_time']
+            # wtr_txがある場合はstop_timeをReadの終了時刻に合わせる
+            stop_time = wtr_tx['stop_time'] if wtr_tx else tx['stop_time']
             
-            # SaleaeTime を Local Timeに変換
             start_dt = start_time.as_datetime().astimezone()
             stop_dt = stop_time.as_datetime().astimezone()
             
@@ -115,30 +140,44 @@ class I2CTransactionHLA(HighLevelAnalyzer):
             duration_us = 0.0
             idle_us = 0.0
 
-        self.last_stop_time = tx['stop_time']
+        self.last_stop_time = stop_time
 
         rw_mode = "R" if tx['is_read_op'] else "W"
-        rep_rw_mode = ("R" if tx['is_rep_read_op'] else "W") if tx['rep_addr'] else ""
+        payload = " ".join(tx['payload'])
         
-        payload = " ".join(tx['w_payload'])
-        rep_payload = " ".join(tx['r_payload'])
+        is_rep_str = 'Y' if tx.get('is_repeated_start', False) else ''
+
+        frame_data = {
+            '01_start_time': start_utc_str,
+            '02_stop_time': stop_utc_str,
+            '03_duration_us': f"{duration_us}",
+            '04_idle_time_us': f"{idle_us}",
+            '05_is_repeated_START': is_rep_str,
+            '06_addr': tx['addr'],
+            '07_rw_mode': rw_mode,
+            '08_addr_ack': tx['addr_ack'],
+            '09_payload': payload,
+        }
+
+        if wtr_tx is not None:
+            wtr_rep_str = 'Y' if wtr_tx.get('is_repeated_start', False) else ''
+            frame_data['10_has_write_then_read(WTR)'] = 'Y'
+            frame_data['11_WTR_is_repeated_START'] = wtr_rep_str
+            frame_data['12_WTR_addr'] = wtr_tx['addr']
+            frame_data['13_WTR_rw_mode'] = 'R'
+            frame_data['14_WTR_addr_ack'] = wtr_tx['addr_ack']
+            frame_data['15_WTR_payload'] = " ".join(wtr_tx['payload'])
+        else:
+            frame_data['10_has_write_then_read(WTR)'] = ''
+            frame_data['11_WTR_is_repeated_START'] = ''
+            frame_data['12_WTR_addr'] = ''
+            frame_data['13_WTR_rw_mode'] = ''
+            frame_data['14_WTR_addr_ack'] = ''
+            frame_data['15_WTR_payload'] = ''
 
         return AnalyzerFrame(
             'I2C_TA',
             start_time=tx['start_time'],
-            end_time=tx['stop_time'],
-            data={
-                '01_start_time': start_utc_str,    # アルファベット順で先頭に来るようにする
-                '02_stop_time': stop_utc_str,
-                '03_duration_us': f"{duration_us}",
-                '04_idle_time_us': f"{idle_us}",
-                '05_addr': tx['addr'],
-                '06_rw_mode': rw_mode,
-                '07_addr_ack': tx['addr_ack'],
-                '08_payload': payload,
-                '09_rep_addr': tx['rep_addr'],
-                '10_rep_rw_mode': rep_rw_mode,
-                '11_rep_addr_ack': tx['rep_addr_ack'],
-                '12_rep_payload': rep_payload
-            }
+            end_time=stop_time,
+            data=frame_data
         )
