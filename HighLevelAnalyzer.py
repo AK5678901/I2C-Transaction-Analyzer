@@ -3,9 +3,13 @@ from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame, StringSetting
 class I2CTransactionHLA(HighLevelAnalyzer):
     exclude_addr = StringSetting(label="Exclude Addresses (e.g. 0x50, 0x60)")
 
+    # Write単体の場合と、Write→Read（WTR）の場合で表示形式を分ける
     result_types = {
-        'I2C_TA': {
-            'format': 'Addr: {{data.05_addr}} [{{data.06_rw_mode}}] Payload: {{data.08_payload}}'
+        'I2C_SingleWriteRead': {
+            'format': 'Addr: {{data.06_addr}} [{{data.07_rw_mode}}] Payload: {{data.09_payload}}'
+        },
+        'I2C_Write_Then_Read': {
+            'format': 'Addr: {{data.06_addr}} [W] Payload: {{data.09_payload}} -> Addr: {{data.12_WTR_addr}} [R] Payload: {{data.15_WTR_payload}}'
         }
     }
 
@@ -167,6 +171,9 @@ class I2CTransactionHLA(HighLevelAnalyzer):
             frame_data['13_WTR_rw_mode'] = 'R'
             frame_data['14_WTR_addr_ack'] = wtr_tx['addr_ack']
             frame_data['15_WTR_payload'] = " ".join(wtr_tx['payload'])
+            
+            # WTRの場合は専用の表示タイプを指定
+            frame_type_name = 'I2C_Write_Then_Read'
         else:
             frame_data['10_has_write_then_read(WTR)'] = ''
             frame_data['11_WTR_is_repeated_START'] = ''
@@ -174,9 +181,12 @@ class I2CTransactionHLA(HighLevelAnalyzer):
             frame_data['13_WTR_rw_mode'] = ''
             frame_data['14_WTR_addr_ack'] = ''
             frame_data['15_WTR_payload'] = ''
+            
+            # 通常（単体）の場合はWrite用（あるいは通常のRead用）の表示タイプを指定
+            frame_type_name = 'I2C_SingleWriteRead'
 
         return AnalyzerFrame(
-            'I2C_TA',
+            frame_type_name,
             start_time=tx['start_time'],
             end_time=stop_time,
             data=frame_data
